@@ -411,6 +411,26 @@ class TestResolveApproval:
         mock_resolve.assert_not_called()
         assert 6 in adapter._approval_state
 
+    @pytest.mark.asyncio
+    async def test_admin_tap_from_dm_resolves_operator_session(self):
+        """Admin's DM tap resolves the operator's session end-to-end.
+
+        The approval is stored with the admin's DM chat_id (Task 3 binding).
+        When the admin taps from their DM, _resolve_approval must:
+          1. pass the v17 union_id auth check (_allowed_group_users)
+          2. pass the chat-mismatch guard (chat_id matches stored oc_admin_dm)
+          3. call resolve_gateway_approval with the ORIGINAL operator session key
+          4. remove the approval from _approval_state
+        """
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"on_adminUNION"}   # admin authorized by union_id (v17)
+        adapter._approval_state[42] = {"session_key": "op-sess", "message_id": "m1", "chat_id": "oc_admin_dm"}
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(42, "once", "Admin",
+                open_id="ou_adminAPP", union_id="on_adminUNION", chat_id="oc_admin_dm")
+        mock_resolve.assert_called_once_with("op-sess", "once")
+        assert 42 not in adapter._approval_state
+
 
 # ===========================================================================
 # Regression: union_id / user_id matching for card-action authorization
