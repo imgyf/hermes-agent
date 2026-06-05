@@ -976,3 +976,72 @@ class TestResolveOpenId:
         adapter._client.contact.v3.user.get = MagicMock(side_effect=AssertionError("should be cached"))
         result2 = await adapter._resolve_open_id_from_union_id("on_unknownUNION")
         assert result2 is None
+
+
+# ===========================================================================
+# TestAdminEscalationSend — DM exec-approval to admin in smart mode
+# ===========================================================================
+
+from gateway.platforms.feishu import SendResult  # noqa: E402
+
+
+class TestAdminEscalationSend:
+    @pytest.mark.asyncio
+    async def test_smart_mode_dms_admin_and_stores_dm_chat(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._escalation_admin_union_id = "on_adminUNION"
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(adapter, "_resolve_open_id_from_union_id", AsyncMock(return_value="ou_adminAPP"))
+        sent = {}
+
+        async def fake_create(*, receive_id, receive_id_type, content):
+            sent.update(receive_id=receive_id, receive_id_type=receive_id_type)
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="m1", chat_id="oc_admin_dm"),
+            )
+
+        monkeypatch.setattr(adapter, "_create_message", fake_create)
+        monkeypatch.setattr(adapter, "_post_operator_notice", AsyncMock())
+        res = await adapter.send_exec_approval(
+            chat_id="oc_operator",
+            command="git branch -D x",
+            session_key="sess-1",
+            description="git branch force delete",
+        )
+        assert res.success and sent == {"receive_id": "ou_adminAPP", "receive_id_type": "open_id"}
+        st = adapter._approval_state[next(iter(adapter._approval_state))]
+        assert st["chat_id"] == "oc_admin_dm" and st["session_key"] == "sess-1"
+        adapter._post_operator_notice.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_manual_mode_unchanged(self, monkeypatch):
+        adapter = _make_adapter()
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "manual")
+        adapter._feishu_send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(message_id="m9"))
+        )
+        adapter._finalize_send_result = lambda r, m: SendResult(success=True, message_id="m9")
+        res = await adapter.send_exec_approval(
+            chat_id="oc_operator", command="x", session_key="s", description="d"
+        )
+        assert res.success
+        adapter._feishu_send_with_retry.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_admin_send_failure_falls_back_to_operator(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._escalation_admin_union_id = "on_adminUNION"
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(
+            adapter, "_resolve_open_id_from_union_id", AsyncMock(return_value=None)
+        )  # resolution fails
+        adapter._feishu_send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(message_id="m9"))
+        )
+        adapter._finalize_send_result = lambda r, m: SendResult(success=True, message_id="m9")
+        res = await adapter.send_exec_approval(
+            chat_id="oc_operator", command="x", session_key="s", description="d"
+        )
+        assert res.success
+        adapter._feishu_send_with_retry.assert_awaited_once()  # fell back to operator chat
