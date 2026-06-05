@@ -59,13 +59,17 @@ def _make_card_action_data(
     chat_id: str = "oc_12345",
     open_id: str = "ou_user1",
     token: str = "tok_abc",
+    union_id: str = "",
+    user_id: str = "",
 ) -> SimpleNamespace:
     """Create a mock Feishu card action callback data object."""
     return SimpleNamespace(
         event=SimpleNamespace(
             token=token,
             context=SimpleNamespace(open_chat_id=chat_id),
-            operator=SimpleNamespace(open_id=open_id),
+            operator=SimpleNamespace(
+                open_id=open_id, union_id=union_id, user_id=user_id
+            ),
             action=SimpleNamespace(
                 tag="button",
                 value=action_value,
@@ -406,6 +410,111 @@ class TestResolveApproval:
 
         mock_resolve.assert_not_called()
         assert 6 in adapter._approval_state
+
+
+# ===========================================================================
+# Regression: union_id / user_id matching for card-action authorization
+# (NousResearch/hermes-agent#37252)
+# ===========================================================================
+
+class TestUnionIdAuthorization37252:
+    """Card-action operators must be authorized by ANY of open_id / union_id /
+    user_id — not open_id alone. union_id (on_…) is stable across Feishu-app
+    re-provisioning, so allowlists keyed by it must match card-clicks."""
+
+    # --- _is_interactive_operator_authorized (unit) ----------------------
+
+    def test_empty_allowlist_allows_any_identifier(self):
+        adapter = _make_adapter()
+        adapter._admins = set()
+        adapter._allowed_group_users = set()
+        assert adapter._is_interactive_operator_authorized("ou_anyone")
+
+    def test_no_identifiers_denied(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_x"}
+        assert not adapter._is_interactive_operator_authorized("", "", "")
+
+    def test_matches_by_union_id_when_open_id_absent(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"on_unionA"}
+        # stale/unknown app-scoped open_id, but the union_id is allowlisted
+        assert adapter._is_interactive_operator_authorized("ou_newapp", "on_unionA", "")
+        assert not adapter._is_interactive_operator_authorized("ou_newapp", "on_other", "")
+
+    def test_matches_by_user_id(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"a8b65267"}
+        assert adapter._is_interactive_operator_authorized("ou_x", "", "a8b65267")
+
+    def test_wildcard_allows_any(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"*"}
+        assert adapter._is_interactive_operator_authorized("ou_anyone")
+
+    # --- _resolve_approval gate (integration) ----------------------------
+
+    @pytest.mark.asyncio
+    async def test_resolve_approval_authorized_by_union_id(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"on_unionA"}
+        adapter._approval_state[7] = {
+            "session_key": "sess-7",
+            "message_id": "msg_007",
+            "chat_id": "oc_12345",
+        }
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(
+                7, "once", "Yifan",
+                open_id="ou_newapp_unknown", union_id="on_unionA", chat_id="oc_12345",
+            )
+        mock_resolve.assert_called_once_with("sess-7", "once")
+        assert 7 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_resolve_approval_rejects_stale_open_id_only(self):
+        # Pre-fix bug: only the union_id is allowlisted and the click carries
+        # just a stale (old-app) open_id → must NOT resolve.
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"on_unionA"}
+        adapter._approval_state[8] = {
+            "session_key": "sess-8",
+            "message_id": "msg_008",
+            "chat_id": "oc_12345",
+        }
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._resolve_approval(
+                8, "once", "Stale", open_id="ou_stale", chat_id="oc_12345",
+            )
+        mock_resolve.assert_not_called()
+        assert 8 in adapter._approval_state
+
+    # --- full inline callback path (gate 1: _allow_group_message) --------
+
+    def test_card_click_authorized_by_union_id(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._default_group_policy = "allowlist"
+        adapter._group_policy = "allowlist"
+        adapter._allowed_group_users = {"on_unionA"}
+        adapter._approval_state[9] = {
+            "session_key": "sess-9",
+            "message_id": "msg-9",
+            "chat_id": "oc_12345",
+        }
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 9},
+            open_id="ou_stale_or_newapp",
+            union_id="on_unionA",
+        )
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+            response = adapter._on_card_action_trigger(data)
+        # Authorized via union_id → returns the resolved (green) card, not a drop.
+        assert response is not None
+        assert response.card is not None
+        assert response.card.data["header"]["template"] == "green"
+
 
 # ===========================================================================
 # _handle_card_action_event — non-approval card actions
