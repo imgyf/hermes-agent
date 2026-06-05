@@ -909,3 +909,20 @@ class TestResolveUpdatePrompt:
         await adapter._resolve_update_prompt(99, "n", "Nobody")
 
         assert not (tmp_path / ".hermes" / ".update_response").exists()
+
+
+# ===========================================================================
+# TestEscalationConfig — escalation_admin_union_id + smart-route gate
+# ===========================================================================
+
+class TestEscalationConfig:
+    def test_route_only_when_smart_and_union_id_set(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._escalation_admin_union_id = "on_adminUNION"
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+        assert adapter._should_route_approval_to_admin() is True
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "manual")
+        assert adapter._should_route_approval_to_admin() is False
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
+        adapter._escalation_admin_union_id = ""
+        assert adapter._should_route_approval_to_admin() is False
