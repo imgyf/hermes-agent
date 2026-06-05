@@ -391,6 +391,7 @@ class FeishuAdapterSettings:
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
     admins: frozenset[str] = frozenset()
+    escalation_admin_union_id: str = ""
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
@@ -1567,6 +1568,7 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
             admins=admins,
+            escalation_admin_union_id=os.getenv("FEISHU_ESCALATION_ADMIN_UNION_ID", "").strip(),
             default_group_policy=default_group_policy,
             group_rules=group_rules,
             allow_bots=allow_bots,
@@ -1585,6 +1587,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._group_policy = settings.group_policy
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
+        self._escalation_admin_union_id = settings.escalation_admin_union_id
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
         self._bot_open_id = settings.bot_open_id
@@ -2590,6 +2593,18 @@ class FeishuAdapter(BasePlatformAdapter):
         if not allowed_ids:
             return True
         return "*" in allowed_ids or bool(candidate_ids & allowed_ids)
+
+    def _should_route_approval_to_admin(self) -> bool:
+        """Return True when approval requests should be routed to the escalation admin via DM.
+
+        Routing is enabled only when BOTH conditions hold:
+        - ``_escalation_admin_union_id`` is non-empty (admin DM target configured), AND
+        - the approval mode is ``"smart"`` (auto-escalation enabled).
+        """
+        if not self._escalation_admin_union_id:
+            return False
+        from tools.approval import _get_approval_mode
+        return _get_approval_mode() == "smart"
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
