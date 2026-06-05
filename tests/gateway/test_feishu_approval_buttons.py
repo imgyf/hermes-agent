@@ -916,6 +916,7 @@ class TestResolveUpdatePrompt:
 # ===========================================================================
 
 class TestEscalationConfig:
+    # _get_approval_mode is imported lazily inside the method; patch the module attribute.
     def test_route_only_when_smart_and_union_id_set(self, monkeypatch):
         adapter = _make_adapter()
         adapter._escalation_admin_union_id = "on_adminUNION"
@@ -926,3 +927,14 @@ class TestEscalationConfig:
         monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "smart")
         adapter._escalation_admin_union_id = ""
         assert adapter._should_route_approval_to_admin() is False
+
+    def test_settings_flow_propagates_escalation_admin_union_id(self):
+        """_load_settings reads escalation_admin_union_id from extra; _apply_settings wires it onto the adapter."""
+        adapter = _make_adapter()
+        # Default: attribute exists and is empty string
+        assert adapter._escalation_admin_union_id == ""
+        # Build settings from extra config and apply — value must flow through
+        settings = FeishuAdapter._load_settings({"escalation_admin_union_id": "on_x"})
+        assert settings.escalation_admin_union_id == "on_x"
+        adapter._apply_settings(settings)
+        assert adapter._escalation_admin_union_id == "on_x"

@@ -1568,7 +1568,10 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
             admins=admins,
-            escalation_admin_union_id=os.getenv("FEISHU_ESCALATION_ADMIN_UNION_ID", "").strip(),
+            escalation_admin_union_id=str(
+                extra.get("escalation_admin_union_id")
+                or os.getenv("FEISHU_ESCALATION_ADMIN_UNION_ID", "")
+            ).strip(),
             default_group_policy=default_group_policy,
             group_rules=group_rules,
             allow_bots=allow_bots,
