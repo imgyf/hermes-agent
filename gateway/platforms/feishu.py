@@ -1454,6 +1454,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
+        self._admin_open_id_cache: Dict[str, str] = {}  # union_id -> open_id ("" = negative cache)
         self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
@@ -1591,8 +1592,6 @@ class FeishuAdapter(BasePlatformAdapter):
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
         self._escalation_admin_union_id = settings.escalation_admin_union_id
-        if not hasattr(self, "_admin_open_id_cache"):
-            self._admin_open_id_cache: dict = {}
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
         self._bot_open_id = settings.bot_open_id
@@ -3990,6 +3989,8 @@ class FeishuAdapter(BasePlatformAdapter):
         Results are permanently cached (positive and negative) so repeated
         admin-DM escalations never make redundant API calls.
         """
+        if not self._client or not union_id:
+            return None
         if union_id in self._admin_open_id_cache:
             return self._admin_open_id_cache[union_id] or None
         try:
