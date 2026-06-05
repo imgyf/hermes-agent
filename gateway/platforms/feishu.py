@@ -1591,6 +1591,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
         self._escalation_admin_union_id = settings.escalation_admin_union_id
+        if not hasattr(self, "_admin_open_id_cache"):
+            self._admin_open_id_cache: dict = {}
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
         self._bot_open_id = settings.bot_open_id
@@ -3981,6 +3983,29 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)
         return None
+
+    async def _resolve_open_id_from_union_id(self, union_id: str) -> Optional[str]:
+        """Resolve a developer-scoped union_id to the app-scoped open_id, with caching.
+
+        Results are permanently cached (positive and negative) so repeated
+        admin-DM escalations never make redundant API calls.
+        """
+        if union_id in self._admin_open_id_cache:
+            return self._admin_open_id_cache[union_id] or None
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
+            request = GetUserRequest.builder().user_id(union_id).user_id_type("union_id").build()
+            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            if not response.success():
+                logger.warning("[Feishu] union_id->open_id failed: %s", getattr(response, "msg", "?"))
+                self._admin_open_id_cache[union_id] = ""   # negative cache
+                return None
+            open_id = str(getattr(response.data.user, "open_id", "") or "")
+            self._admin_open_id_cache[union_id] = open_id
+            return open_id or None
+        except Exception as exc:
+            logger.warning("[Feishu] union_id->open_id error: %s", exc)
+            return None
 
     async def _fetch_bot_names(self, bot_ids: List[str]) -> Optional[Dict[str, str]]:
         if not self._client or not bot_ids:
