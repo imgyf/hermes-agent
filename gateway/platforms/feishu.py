@@ -1868,6 +1868,96 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    def _build_exec_approval_card(self, command: str, description: str, approval_id: int) -> Dict[str, Any]:
+        """Build the interactive approval card dict for *approval_id*."""
+        cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
+
+        def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": btn_type,
+                "value": {"hermes_action": action_name, "approval_id": approval_id},
+            }
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        _btn("✅ Allow Once", "approve_once", "primary"),
+                        _btn("✅ Session", "approve_session"),
+                        _btn("✅ Always", "approve_always"),
+                        _btn("❌ Deny", "deny", "danger"),
+                    ],
+                },
+            ],
+        }
+
+    async def _create_message(self, *, receive_id: str, receive_id_type: str, content: str) -> Any:
+        """Send a create-message API call directly (bypasses chat_id routing)."""
+        import uuid as _uuid
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type="interactive",
+            content=content,
+            uuid_value=str(_uuid.uuid4()),
+        )
+        request = self._build_create_message_request(receive_id_type, body)
+        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+
+    async def _post_operator_notice(self, chat_id: str, text: str) -> None:
+        """Send a short notice to the operator chat; swallows failures."""
+        try:
+            await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="text",
+                payload=json.dumps({"text": text}, ensure_ascii=False),
+                reply_to=None,
+                metadata=None,
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] operator notice failed: %s", exc)
+
+    async def _send_exec_approval_to_admin(
+        self,
+        *,
+        operator_chat_id: str,
+        command: str,
+        session_key: str,
+        description: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """DM the approval card to the escalation admin open_id."""
+        open_id = await self._resolve_open_id_from_union_id(self._escalation_admin_union_id)
+        if not open_id:
+            return SendResult(success=False, error="admin open_id unresolved")
+        approval_id = next(self._approval_counter)
+        card = self._build_exec_approval_card(command, description, approval_id)
+        resp = await self._create_message(
+            receive_id=open_id,
+            receive_id_type="open_id",
+            content=json.dumps(card, ensure_ascii=False),
+        )
+        if not resp.success():
+            return SendResult(success=False, error="admin DM send failed")
+        self._approval_state[approval_id] = {
+            "session_key": session_key,
+            "message_id": str(getattr(resp.data, "message_id", "") or ""),
+            "chat_id": str(getattr(resp.data, "chat_id", "") or ""),  # admin p2p chat
+        }
+        await self._post_operator_notice(operator_chat_id, "⏳ This command needs admin approval — notified.")
+        return SendResult(success=True, message_id=str(getattr(resp.data, "message_id", "") or ""))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -1878,44 +1968,33 @@ class FeishuAdapter(BasePlatformAdapter):
         The buttons carry ``hermes_action`` in their value dict so that
         ``_handle_card_action_event`` can intercept them and call
         ``resolve_gateway_approval()`` to unblock the waiting agent thread.
+
+        In smart mode with an escalation admin configured, the card is DM'd to
+        the admin instead; the operator receives a short notice.  On any failure
+        the method falls back to the normal operator-chat path.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        if self._should_route_approval_to_admin():
+            res = await self._send_exec_approval_to_admin(
+                operator_chat_id=chat_id,
+                command=command,
+                session_key=session_key,
+                description=description,
+                metadata=metadata,
+            )
+            if res.success:
+                return res
+            logger.warning(
+                "[Feishu] admin escalation routing failed (%s); falling back to operator chat",
+                res.error,
+            )
+            # fall through to the normal operator-chat path below
+
         try:
             approval_id = next(self._approval_counter)
-            cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
-
-            def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
-                return {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": label},
-                    "type": btn_type,
-                    "value": {"hermes_action": action_name, "approval_id": approval_id},
-                }
-
-            card = {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
-                    "template": "orange",
-                },
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
-                    },
-                    {
-                        "tag": "action",
-                        "actions": [
-                            _btn("✅ Allow Once", "approve_once", "primary"),
-                            _btn("✅ Session", "approve_session"),
-                            _btn("✅ Always", "approve_always"),
-                            _btn("❌ Deny", "deny", "danger"),
-                        ],
-                    },
-                ],
-            }
+            card = self._build_exec_approval_card(command, description, approval_id)
 
             payload = json.dumps(card, ensure_ascii=False)
             response = await self._feishu_send_with_retry(
