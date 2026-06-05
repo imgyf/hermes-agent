@@ -938,3 +938,41 @@ class TestEscalationConfig:
         assert settings.escalation_admin_union_id == "on_x"
         adapter._apply_settings(settings)
         assert adapter._escalation_admin_union_id == "on_x"
+
+
+# ===========================================================================
+# TestResolveOpenId — cached union_id → app-scoped open_id resolver
+# ===========================================================================
+
+class TestResolveOpenId:
+    @pytest.mark.asyncio
+    async def test_resolves_and_caches(self):
+        adapter = _make_adapter()
+        resp = SimpleNamespace(success=lambda: True,
+                               data=SimpleNamespace(user=SimpleNamespace(open_id="ou_adminAPP")))
+        adapter._client.contact.v3.user.get = MagicMock(return_value=resp)
+        # Ensure the lazy GetUserRequest import resolves from the mocked lark_oapi
+        contact_mod = MagicMock()
+        contact_mod.GetUserRequest = MagicMock()
+        contact_mod.GetUserRequest.builder.return_value.user_id.return_value.user_id_type.return_value.build.return_value = object()
+        with patch.dict(sys.modules, {"lark_oapi.api.contact.v3": contact_mod}):
+            assert await adapter._resolve_open_id_from_union_id("on_adminUNION") == "ou_adminAPP"
+            # second call must be cached (no second API hit)
+            adapter._client.contact.v3.user.get = MagicMock(side_effect=AssertionError("cached"))
+            assert await adapter._resolve_open_id_from_union_id("on_adminUNION") == "ou_adminAPP"
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_returns_none_and_negative_caches(self):
+        adapter = _make_adapter()
+        resp = SimpleNamespace(success=lambda: False, msg="permission denied")
+        adapter._client.contact.v3.user.get = MagicMock(return_value=resp)
+        contact_mod = MagicMock()
+        contact_mod.GetUserRequest = MagicMock()
+        contact_mod.GetUserRequest.builder.return_value.user_id.return_value.user_id_type.return_value.build.return_value = object()
+        with patch.dict(sys.modules, {"lark_oapi.api.contact.v3": contact_mod}):
+            result = await adapter._resolve_open_id_from_union_id("on_unknownUNION")
+        assert result is None
+        # negative-cached: second call must NOT hit the API again
+        adapter._client.contact.v3.user.get = MagicMock(side_effect=AssertionError("should be cached"))
+        result2 = await adapter._resolve_open_id_from_union_id("on_unknownUNION")
+        assert result2 is None
